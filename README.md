@@ -10,7 +10,11 @@ This Flutter app provides a user-friendly interface for transmitting **SAME (Spe
 - In Addition **USB OTG must be enabled**.  
 - Without a HackRF connected, the app will not initialize properly.  
 
+**Want an APK Without Compiling?**
+Buy it here: https://sarahsforge.dev/products/pocketsame
+
 ---
+
 
 ## Getting Started
 

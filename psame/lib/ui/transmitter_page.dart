@@ -65,24 +65,36 @@ class _TransmitterPageState extends State<TransmitterPage> {
     }
   }
 
-  void _startSame() {
+  // [MODIFIED] This method now awaits the single burst and updates the UI upon completion.
+  void _startSame() async {
     if (!_formKey.currentState!.validate() || !_isInitialized || _isTransmitting) return;
 
     setState(() {
       _isTransmitting = true;
-      _status = "Transmitting SAME: ${_selectedEvent.key}...";
+      _status = "Transmitting SAME burst: ${_selectedEvent.key}...";
     });
 
-    _controller.transmitSameAlert(
-      frequencyMhz: _selectedFrequency,
-      txVgaGain: _txVgaGain.toInt(),
-      org: _selectedOriginator,
-      event: _selectedEvent.key,
-      fips: _fipsController.text,
-      purgeTime: _selectedPurgeTime,
-      issueTime: SameProtocol.generateIssueTime(),
-      stationId: _stationIdController.text
-    ).catchError(_handleError);
+    try {
+      await _controller.transmitSameAlert(
+        frequencyMhz: _selectedFrequency,
+        txVgaGain: _txVgaGain.toInt(),
+        org: _selectedOriginator,
+        event: _selectedEvent.key,
+        fips: _fipsController.text,
+        purgeTime: _selectedPurgeTime,
+        issueTime: SameProtocol.generateIssueTime(),
+        stationId: _stationIdController.text
+      );
+      // This code runs only after the transmission is successfully completed
+      if (mounted) {
+        setState(() {
+          _status = "Transmission Complete.";
+          _isTransmitting = false;
+        });
+      }
+    } catch (e) {
+      _handleError(e);
+    }
   }
 
   void _startTone() {
@@ -99,6 +111,7 @@ class _TransmitterPageState extends State<TransmitterPage> {
 
   void _stop() {
     if (!_isTransmitting) return;
+    // For tone, this stops the loop. For SAME, it's a failsafe.
     _controller.stop();
     setState(() {
       _isTransmitting = false;
@@ -115,6 +128,7 @@ class _TransmitterPageState extends State<TransmitterPage> {
     }
   }
 
+  // No changes to the build methods below this point
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -313,7 +327,6 @@ class _TransmitterPageState extends State<TransmitterPage> {
     }
   }
 }
-
 
 class _EventPickerDialog extends StatefulWidget {
   @override

@@ -17,7 +17,7 @@ class FmTransmitterController {
     _transmitter = FmTransmitter(_hackrf);
   }
 
-  /// [MODIFIED] Generates and transmits a SAME alert using parameters from the UI.
+  /// [MODIFIED] Generates and transmits a single SAME alert burst then stops.
   Future<void> transmitSameAlert({
     // Radio parameters
     required double frequencyMhz,
@@ -31,34 +31,30 @@ class FmTransmitterController {
     required String stationId,
     // Other parameters
     double sampleRateMhz = 2.0,
-    Duration interval = const Duration(seconds: 30),
   }) async {
     if (_isTransmitting) return;
     _isTransmitting = true;
 
-    _transmitter.sampleRate = sampleRateMhz * 1e6;
-    _transmitter.freqDeviation = 5000; // SAME deviation is typically fixed at 5kHz
+    try {
+      _transmitter.sampleRate = sampleRateMhz * 1e6;
+      _transmitter.freqDeviation = 5000; // SAME deviation is typically fixed at 5kHz
 
-    await _transmitter.configure(frequencyMhz: frequencyMhz, txVgaGain: txVgaGain);
+      await _transmitter.configure(frequencyMhz: frequencyMhz, txVgaGain: txVgaGain);
 
-    final message = SameProtocol.buildMessage(
-      org: org,
-      event: event,
-      fips: fips,
-      purgeTime: purgeTime,
-      issueTime: issueTime,
-      stationId: stationId
-    );
-    final payload = SameProtocol.generatePayload(message: message, repeat: 3);
-    final audio = SameProtocol.generateAfskAudio(data: payload, sampleRate: _transmitter.sampleRate);
-    final iqData = _transmitter.modulateFm(audio).buffer.asUint8List();
+      final message = SameProtocol.buildMessage(
+        org: org, event: event, fips: fips,
+        purgeTime: purgeTime, issueTime: issueTime, stationId: stationId
+      );
+      // The payload already contains the 3 repetitions of the alert
+      final payload = SameProtocol.generatePayload(message: message, repeat: 3);
+      final audio = SameProtocol.generateAfskAudio(data: payload, sampleRate: _transmitter.sampleRate);
+      final iqData = _transmitter.modulateFm(audio).buffer.asUint8List();
 
-    await _transmitter.startTx();
+      await _transmitter.startTx();
 
-    while (_isTransmitting) {
+      // [CHANGE] Removed the while loop. We now send the data only once.
       const chunkSize = 262144;
       for (int i = 0; i < iqData.length; i += chunkSize) {
-        if (!_isTransmitting) break;
         final end = (i + chunkSize > iqData.length) ? iqData.length : i + chunkSize;
         final chunk = iqData.sublist(i, end);
 
@@ -69,13 +65,14 @@ class FmTransmitterController {
           await _transmitter.sendData(chunk);
         }
       }
-      if (!_isTransmitting) break;
-      await Future.delayed(interval);
+    } finally {
+      // [CHANGE] This block ensures the transmitter is always stopped and the state is reset.
+      await _transmitter.stopTx();
+      _isTransmitting = false;
     }
-    await _transmitter.stopTx();
   }
 
-  /// [MODIFIED] Transmits a continuous test tone using parameters from the UI.
+  /// Transmits a continuous test tone. (No changes to this method)
   Future<void> transmitTone({
     required double frequencyMhz,
     required int txVgaGain,
@@ -86,17 +83,20 @@ class FmTransmitterController {
     if (_isTransmitting) return;
     _isTransmitting = true;
 
-    _transmitter.sampleRate = sampleRateMhz * 1e6;
-    _transmitter.freqDeviation = deviation;
+    try {
+      _transmitter.sampleRate = sampleRateMhz * 1e6;
+      _transmitter.freqDeviation = deviation;
 
-    await _transmitter.configure(frequencyMhz: frequencyMhz, txVgaGain: txVgaGain);
-    await _transmitter.startTx();
+      await _transmitter.configure(frequencyMhz: frequencyMhz, txVgaGain: txVgaGain);
+      await _transmitter.startTx();
 
-    while (_isTransmitting) {
-      final toneBuffer = _transmitter.generateToneBuffer(toneFreq, 0.1);
-      await _transmitter.sendData(toneBuffer);
+      while (_isTransmitting) {
+        final toneBuffer = _transmitter.generateToneBuffer(toneFreq, 0.1);
+        await _transmitter.sendData(toneBuffer);
+      }
+    } finally {
+      await _transmitter.stopTx();
     }
-    await _transmitter.stopTx();
   }
 
   void stop() {

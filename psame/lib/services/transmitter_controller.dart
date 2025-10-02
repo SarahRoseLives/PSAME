@@ -17,40 +17,49 @@ class FmTransmitterController {
     _transmitter = FmTransmitter(_hackrf);
   }
 
-  /// Generates and transmits a SAME alert.
+  /// [MODIFIED] Generates and transmits a SAME alert using parameters from the UI.
   Future<void> transmitSameAlert({
-    double frequencyMhz = 162.550,
-    int txVgaGain = 30,
+    // Radio parameters
+    required double frequencyMhz,
+    required int txVgaGain,
+    // SAME message parameters
+    required String org,
+    required String event,
+    required String fips,
+    required String purgeTime,
+    required String issueTime,
+    required String stationId,
+    // Other parameters
     double sampleRateMhz = 2.0,
-    double deviation = 5000,
     Duration interval = const Duration(seconds: 30),
   }) async {
     if (_isTransmitting) return;
     _isTransmitting = true;
 
     _transmitter.sampleRate = sampleRateMhz * 1e6;
-    _transmitter.freqDeviation = deviation;
+    _transmitter.freqDeviation = 5000; // SAME deviation is typically fixed at 5kHz
 
     await _transmitter.configure(frequencyMhz: frequencyMhz, txVgaGain: txVgaGain);
 
-    // --- Orchestration Logic ---
-    // 1. Build the SAME message string.
-    final message = SameProtocol.buildMessage();
-    // 2. Generate the full data payload (preamble + message).
+    final message = SameProtocol.buildMessage(
+      org: org,
+      event: event,
+      fips: fips,
+      purgeTime: purgeTime,
+      issueTime: issueTime,
+      stationId: stationId
+    );
     final payload = SameProtocol.generatePayload(message: message, repeat: 3);
-    // 3. Encode the payload into AFSK audio.
     final audio = SameProtocol.generateAfskAudio(data: payload, sampleRate: _transmitter.sampleRate);
-    // 4. Modulate the AFSK audio into FM I/Q samples.
     final iqData = _transmitter.modulateFm(audio).buffer.asUint8List();
 
     await _transmitter.startTx();
 
     while (_isTransmitting) {
-      const chunkSize = 262144; // HackRF's preferred chunk size
+      const chunkSize = 262144;
       for (int i = 0; i < iqData.length; i += chunkSize) {
         if (!_isTransmitting) break;
-
-        final end = (i + chunkSize < iqData.length) ? i + chunkSize : iqData.length;
+        final end = (i + chunkSize > iqData.length) ? iqData.length : i + chunkSize;
         final chunk = iqData.sublist(i, end);
 
         if (chunk.length < chunkSize) {
@@ -63,14 +72,13 @@ class FmTransmitterController {
       if (!_isTransmitting) break;
       await Future.delayed(interval);
     }
-
     await _transmitter.stopTx();
   }
 
-  /// Transmits a continuous test tone.
+  /// [MODIFIED] Transmits a continuous test tone using parameters from the UI.
   Future<void> transmitTone({
-    double frequencyMhz = 162.550,
-    int txVgaGain = 30,
+    required double frequencyMhz,
+    required int txVgaGain,
     double sampleRateMhz = 2.0,
     double toneFreq = 1000,
     double deviation = 2000,
@@ -85,7 +93,6 @@ class FmTransmitterController {
     await _transmitter.startTx();
 
     while (_isTransmitting) {
-      // The tone buffer maintains continuous phase internally
       final toneBuffer = _transmitter.generateToneBuffer(toneFreq, 0.1);
       await _transmitter.sendData(toneBuffer);
     }

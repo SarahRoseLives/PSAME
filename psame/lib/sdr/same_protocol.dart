@@ -5,22 +5,35 @@ import 'dart:typed_data';
 
 /// Handles the logic for generating SAME protocol messages and AFSK audio.
 class SameProtocol {
-  // SAME Protocol Constants
+  // ... (all existing constants remain the same)
   static const double baudRate = 520.833333333;
-  static const double markFreq = 2083.333333333; // 4 * baudRate
-  static const double spaceFreq = 1562.5; // 3 * baudRate
+  static const double markFreq = 2083.333333333;
+  static const double spaceFreq = 1562.5;
   static const int preambleByte = 0xAB;
   static const int preambleLength = 16;
   static const int endOfMessageLength = 3;
 
+
+  /// [NEW] Generates the issue time string in SAME format (DDDHHMM).
+  static String generateIssueTime() {
+    final now = DateTime.now().toUtc();
+    final dayOfYear = now.difference(DateTime.utc(now.year, 1, 1)).inDays + 1;
+    final dayString = dayOfYear.toString().padLeft(3, '0');
+    final hourString = now.hour.toString().padLeft(2, '0');
+    final minuteString = now.minute.toString().padLeft(2, '0');
+    return '$dayString$hourString$minuteString';
+  }
+
+  // ... (all other existing methods like buildMessage, generatePayload, generateAfskAudio remain the same)
+
   /// Builds the full SAME message string.
   static String buildMessage({
-    String org = 'WXR',
-    String event = 'RWT',
-    String fips = '039007', // Ashtabula County, OH (where Jefferson is)
-    String purgeTime = '0030',
-    String issueTime = '2750800', // Day 275 (Oct 2), 08:00 UTC
-    String stationId = 'KCLE-NWR',
+    required String org,
+    required String event,
+    required String fips,
+    required String purgeTime,
+    required String issueTime,
+    required String stationId,
   }) {
     return 'ZCZC-$org-$event-$fips+$purgeTime-$issueTime-$stationId-';
   }
@@ -30,25 +43,23 @@ class SameProtocol {
     required String message,
     int repeat = 3,
   }) {
-    final preamble = Uint8List(preambleLength)..fillRange(0, preambleLength, preambleByte);
+    final preamble = Uint8List(preambleLength)
+      ..fillRange(0, preambleLength, preambleByte);
     final messageBytes = Uint8List.fromList(message.codeUnits);
-    // The EOM (End of Message) is just three NUL bytes after the main message
     final eom = Uint8List(endOfMessageLength);
 
     final payload = <int>[];
     for (int i = 0; i < repeat; i++) {
       payload.addAll(preamble);
       payload.addAll(messageBytes);
-      if (i < (repeat -1)) { // Add EOM between messages
-          payload.addAll(eom);
+      if (i < (repeat - 1)) {
+        payload.addAll(eom);
       }
     }
-
     return Uint8List.fromList(payload);
   }
 
   /// Generates AFSK audio from a data payload.
-  /// This translates the 1s and 0s of the data into sine waves of different frequencies.
   static Float32List generateAfskAudio({
     required Uint8List data,
     required double sampleRate,
@@ -76,7 +87,8 @@ class SameProtocol {
           final currentByte = data[byteCounter];
           final currentBit = (currentByte >> bitInByte) & 1; // LSB-first
 
-          currentPhaseIncr = (currentBit == 1) ? phaseIncrMark : phaseIncrSpace;
+          currentPhaseIncr =
+              (currentBit == 1) ? phaseIncrMark : phaseIncrSpace;
         }
       }
 

@@ -1,253 +1,484 @@
-import 'dart:async';
-import 'dart:math';
 import 'dart:typed_data';
+import 'dart:math';
 import 'package:flutter/material.dart';
-import 'package:flutter_sound/flutter_sound.dart';
+import 'package:hackrf_flutter/hackrf_flutter.dart';
 
-void main() => runApp(const SAMETransmitterApp());
+// Your existing FmTransmitter class (no changes needed here)
+enum TransmitMode { same, tone }
 
-class SAMETransmitterApp extends StatelessWidget {
-  const SAMETransmitterApp({super.key});
+class FmTransmitter {
+  final HackrfFlutter _hackrf;
+
+  // SAME Protocol Constants
+  static const double baudRate = 520.833333333;
+  static const double markFreq = 2083.333333333; // 4 * baudRate
+  static const double spaceFreq = 1562.5; // 3 * baudRate
+  static const int preambleByte = 0xAB;
+  static const int preambleLength = 16;
+
+  // Transmission parameters
+  double sampleRate;
+  double freqDeviation;
+  double carrierOffset;
+  TransmitMode mode;
+
+  // State for continuous tone generation
+  double _audioPhase = 0.0;
+  double _fmPhase = 0.0;
+
+  FmTransmitter(
+    this._hackrf, {
+    this.sampleRate = 2e6,
+    this.freqDeviation = 2500,
+    this.carrierOffset = 0,
+    this.mode = TransmitMode.tone,
+  });
+
+  /// Build SAME message
+  String buildSameMessage({
+    String org = 'WXR',
+    String event = 'RWT',
+    String fips = '039007',
+    String purgeTime = '0030',
+    String issueTime = '2750700',
+    String stationId = 'KCLE-NWR',
+  }) {
+    return 'ZCZC-$org-$event-$fips+$purgeTime-$issueTime-$stationId-';
+  }
+
+  /// Generate AFSK audio from data
+  Float32List generateAfskAudio(Uint8List data) {
+    final samplesPerBit = sampleRate / baudRate;
+    final totalSamples = (data.length * 8 * samplesPerBit).ceil();
+    final audio = Float32List(totalSamples);
+
+    double phase = 0.0;
+    final phaseIncrMark = 2.0 * pi * markFreq / sampleRate;
+    final phaseIncrSpace = 2.0 * pi * spaceFreq / sampleRate;
+
+    int bitCounter = -1;
+    double currentPhaseIncr = 0.0;
+
+    for (int i = 0; i < totalSamples; i++) {
+      final currentBitInStream = (i / samplesPerBit).floor();
+
+      if (bitCounter != currentBitInStream) {
+        bitCounter = currentBitInStream;
+        final byteCounter = bitCounter ~/ 8;
+        final bitInByte = bitCounter % 8;
+
+        if (byteCounter < data.length) {
+          final currentByte = data[byteCounter];
+          final currentBit = (currentByte >> bitInByte) & 1; // LSB-first
+
+          currentPhaseIncr = (currentBit == 1) ? phaseIncrMark : phaseIncrSpace;
+        }
+      }
+
+      audio[i] = sin(phase);
+      phase += currentPhaseIncr;
+
+      while (phase >= 2.0 * pi) {
+        phase -= 2.0 * pi;
+      }
+      while (phase < 0) {
+        phase += 2.0 * pi;
+      }
+    }
+
+    return audio;
+  }
+
+  /// FM modulate audio signal
+  Int8List modulateFm(Float32List audio) {
+    final samples = Int8List(audio.length * 2);
+    double phase = 0.0;
+
+    for (int i = 0; i < audio.length; i++) {
+      final audioSample = audio[i];
+
+      // FM modulation: instantaneous frequency = carrier + deviation * audio
+      final instantaneousFreq = carrierOffset + (freqDeviation * audioSample);
+      final phaseIncrement = 2.0 * pi * instantaneousFreq / sampleRate;
+
+      phase += phaseIncrement;
+
+      while (phase >= 2.0 * pi) {
+        phase -= 2.0 * pi;
+      }
+      while (phase < 0) {
+        phase += 2.0 * pi;
+      }
+
+      // Generate I/Q samples
+      final iSample = (127.0 * cos(phase)).round().clamp(-128, 127);
+      final qSample = (127.0 * sin(phase)).round().clamp(-128, 127);
+
+      samples[i * 2] = iSample;
+      samples[i * 2 + 1] = qSample;
+    }
+
+    return samples;
+  }
+
+  /// Generate SAME message I/Q data
+  Uint8List generateSameIq({
+    required String org,
+    required String event,
+    required String fips,
+    required String purgeTime,
+    required String issueTime,
+    required String stationId,
+    int repeat = 3,
+  }) {
+    final message = buildSameMessage(
+      org: org,
+      event: event,
+      fips: fips,
+      purgeTime: purgeTime,
+      issueTime: issueTime,
+      stationId: stationId,
+    );
+
+    // Build payload: preamble + message, repeated
+    final preamble = Uint8List(preambleLength)..fillRange(0, preambleLength, preambleByte);
+    final messageBytes = Uint8List.fromList(message.codeUnits);
+
+    final payload = <int>[];
+    for (int i = 0; i < repeat; i++) {
+      payload.addAll(preamble);
+      payload.addAll(messageBytes);
+    }
+
+    final fullPayload = Uint8List.fromList(payload);
+
+    // Generate AFSK audio
+    final audio = generateAfskAudio(fullPayload);
+
+    // FM modulate
+    final iqData = modulateFm(audio);
+
+    return iqData.buffer.asUint8List();
+  }
+
+  /// Generate a continuous tone buffer (for testing)
+  Uint8List generateToneBuffer(double toneFreq, double durationSeconds) {
+    final bufferSamples = (sampleRate * durationSeconds).round();
+    final buffer = Int8List(bufferSamples * 2);
+
+    final audioPhaseIncr = 2.0 * pi * toneFreq / sampleRate;
+
+    for (int i = 0; i < bufferSamples; i++) {
+      // Generate audio sample
+      final audioSample = sin(_audioPhase);
+      _audioPhase += audioPhaseIncr;
+      if (_audioPhase >= 2.0 * pi) {
+        _audioPhase -= 2.0 * pi;
+      }
+
+      // FM modulate
+      final instantaneousFreq = carrierOffset + (freqDeviation * audioSample);
+      final phaseIncrement = 2.0 * pi * instantaneousFreq / sampleRate;
+      _fmPhase += phaseIncrement;
+
+      if (_fmPhase >= 2.0 * pi) {
+        _fmPhase -= 2.0 * pi;
+      }
+      if (_fmPhase < 0) {
+        _fmPhase += 2.0 * pi;
+      }
+
+      // Generate I/Q samples
+      final iSample = (127.0 * cos(_fmPhase)).round().clamp(-128, 127);
+      final qSample = (127.0 * sin(_fmPhase)).round().clamp(-128, 127);
+
+      buffer[i * 2] = iSample;
+      buffer[i * 2 + 1] = qSample;
+    }
+
+    return buffer.buffer.asUint8List();
+  }
+
+  /// Configure HackRF for transmission
+  Future<void> configure({
+    required double frequencyMhz,
+    required int txVgaGain,
+  }) async {
+    await _hackrf.setFrequency((frequencyMhz * 1e6).toInt());
+    await _hackrf.setSampleRate(sampleRate.toInt());
+    await _hackrf.setTxVgaGain(txVgaGain);
+  }
+
+  /// Start transmitting (call this before sending data)
+  Future<void> startTx() async {
+    await _hackrf.startTx();
+  }
+
+  /// Stop transmission
+  Future<void> stopTx() async {
+    await _hackrf.stopTx();
+  }
+
+  /// Send data buffer
+  Future<void> sendData(Uint8List data) async {
+    await _hackrf.sendData(data);
+  }
+}
+
+// ---- MODIFIED CLASS ----
+/// Example usage class
+class FmTransmitterController {
+  // Change 1: Declare _hackrf but do not initialize it here.
+  // We use 'late' to promise Dart that it will be initialized before use.
+  late final HackrfFlutter _hackrf;
+  late final FmTransmitter _transmitter;
+  bool _isTransmitting = false;
+
+  // Change 2: Create an async init method for setup.
+  Future<void> init() async {
+    // Initialize the plugin and transmitter here, safely.
+    _hackrf = HackrfFlutter();
+    await _hackrf.init();
+    _transmitter = FmTransmitter(_hackrf);
+  }
+
+  /// Transmit SAME alert
+  Future<void> transmitSameAlert({
+    double frequencyMhz = 162.550,
+    int txVgaGain = 30,
+    double sampleRateMhz = 2.0,
+    double deviation = 5000,
+    Duration interval = const Duration(seconds: 30),
+  }) async {
+    if (_isTransmitting) return; // Prevent multiple transmissions
+    _isTransmitting = true;
+
+    _transmitter.sampleRate = sampleRateMhz * 1e6;
+    _transmitter.freqDeviation = deviation;
+    _transmitter.mode = TransmitMode.same;
+
+    await _transmitter.configure(
+      frequencyMhz: frequencyMhz,
+      txVgaGain: txVgaGain,
+    );
+
+    final iqData = _transmitter.generateSameIq(
+      org: 'WXR',
+      event: 'RWT',
+      fips: '039007', // Ashtabula County, Ohio
+      purgeTime: '0030',
+      issueTime: '2750700', // Day 275, 07:00 UTC
+      stationId: 'KCLE-NWR',
+      repeat: 3,
+    );
+
+    await _transmitter.startTx();
+
+    // Transmission loop
+    while (_isTransmitting) {
+      // Send burst
+      const chunkSize = 262144;
+      for (int i = 0; i < iqData.length; i += chunkSize) {
+        if (!_isTransmitting) break;
+
+        final end = (i + chunkSize < iqData.length) ? i + chunkSize : iqData.length;
+        final chunk = iqData.sublist(i, end);
+
+        if (chunk.length < chunkSize) {
+          final padded = Uint8List(chunkSize)..setRange(0, chunk.length, chunk);
+          await _transmitter.sendData(padded);
+        } else {
+          await _transmitter.sendData(chunk);
+        }
+      }
+
+      if (!_isTransmitting) break;
+      await Future.delayed(interval);
+    }
+
+    await _transmitter.stopTx();
+  }
+
+  /// Transmit continuous tone
+  Future<void> transmitTone({
+    double frequencyMhz = 162.550,
+    int txVgaGain = 30,
+    double sampleRateMhz = 2.0,
+    double toneFreq = 1000,
+    double deviation = 2000,
+  }) async {
+    if (_isTransmitting) return; // Prevent multiple transmissions
+    _isTransmitting = true;
+
+    _transmitter.sampleRate = sampleRateMhz * 1e6;
+    _transmitter.freqDeviation = deviation;
+    _transmitter.mode = TransmitMode.tone;
+
+    await _transmitter.configure(
+      frequencyMhz: frequencyMhz,
+      txVgaGain: txVgaGain,
+    );
+
+    await _transmitter.startTx();
+
+    final toneBuffer = _transmitter.generateToneBuffer(toneFreq, 0.1);
+
+    while (_isTransmitting) {
+      await _transmitter.sendData(toneBuffer);
+    }
+
+    await _transmitter.stopTx();
+  }
+
+  void stop() {
+    _isTransmitting = false;
+  }
+}
+
+
+// ---- NEW CODE: main() and UI ----
+
+Future<void> main() async {
+  // This line is CRUCIAL. It ensures the Flutter binding is initialized
+  // before any platform channel calls are made.
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SAME Transmitter',
-      home: Scaffold(
-        appBar: AppBar(title: const Text('SAME Transmitter')),
-        body: const Center(child: TransmitButton()),
+      title: 'HackRF FM Transmitter',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        useMaterial3: true,
       ),
+      home: const TransmitterPage(),
     );
   }
 }
 
-class TransmitButton extends StatefulWidget {
-  const TransmitButton({super.key});
+class TransmitterPage extends StatefulWidget {
+  const TransmitterPage({super.key});
 
   @override
-  State<TransmitButton> createState() => _TransmitButtonState();
+  State<TransmitterPage> createState() => _TransmitterPageState();
 }
 
-class _TransmitButtonState extends State<TransmitButton> {
-  final FlutterSoundPlayer _player = FlutterSoundPlayer();
-  bool _isPlaying = false;
+class _TransmitterPageState extends State<TransmitterPage> {
+  final FmTransmitterController _controller = FmTransmitterController();
+  bool _isInitialized = false;
+  bool _isTransmitting = false;
+  String _status = "Not Initialized";
 
   @override
   void initState() {
     super.initState();
-    _player.openPlayer();
+    _initializeApp();
   }
 
-  @override
-  void dispose() {
-    _player.closePlayer();
-    super.dispose();
+  Future<void> _initializeApp() async {
+    try {
+      setState(() {
+        _status = "Initializing...";
+      });
+      await _controller.init();
+      setState(() {
+        _isInitialized = true;
+        _status = "Ready. Plug in HackRF.";
+      });
+    } catch (e) {
+      setState(() {
+        _status = "Error initializing: $e";
+      });
+    }
   }
 
-  Future<void> _transmit() async {
-    if (_isPlaying) return;
-    setState(() => _isPlaying = true);
+  void _startSame() {
+    if (!_isInitialized || _isTransmitting) return;
+    setState(() {
+      _isTransmitting = true;
+      _status = "Transmitting SAME Alert...";
+    });
+    // We don't await this call so the UI remains responsive
+    _controller.transmitSameAlert().catchError((e) {
+      if(mounted) {
+        setState(() {
+          _status = "Error: $e";
+          _isTransmitting = false;
+        });
+      }
+    });
+  }
 
-    // Generate SAME message audio
-    final Uint8List wavBytes = await SAMEMessageGenerator.generateSAMEWav();
+  void _startTone() {
+    if (!_isInitialized || _isTransmitting) return;
+    setState(() {
+      _isTransmitting = true;
+      _status = "Transmitting 1kHz Tone...";
+    });
+    // We don't await this call so the UI remains responsive
+    _controller.transmitTone().catchError((e) {
+      if(mounted) {
+        setState(() {
+          _status = "Error: $e";
+          _isTransmitting = false;
+        });
+      }
+    });
+  }
 
-    // Play through phone speaker
-    await _player.startPlayer(
-      fromDataBuffer: wavBytes,
-      codec: Codec.pcm16WAV,
-      whenFinished: () => setState(() => _isPlaying = false),
-    );
+  void _stop() {
+    if (!_isTransmitting) return;
+    _controller.stop();
+    setState(() {
+      _isTransmitting = false;
+      _status = "Stopped. Ready to transmit.";
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    return ElevatedButton(
-      onPressed: _isPlaying ? null : _transmit,
-      child: Text(_isPlaying ? 'Transmitting...' : 'Transmit SAME Message'),
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('HackRF Transmitter'),
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text(
+                'Status: $_status',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                onPressed: (_isInitialized && !_isTransmitting) ? _startSame : null,
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
+                child: const Text('Transmit SAME Alert (RWT)'),
+              ),
+              const SizedBox(height: 12),
+              ElevatedButton(
+                onPressed: (_isInitialized && !_isTransmitting) ? _startTone : null,
+                child: const Text('Transmit 1kHz Test Tone'),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                onPressed: _isTransmitting ? _stop : null,
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                child: const Text('Stop Transmitting'),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
-}
-
-class SAMEMessageGenerator {
-  // ========== SAME Parameters ==========
-  // Mark = 2083.33 Hz, Space = 1562.5 Hz, bit duration = 1.92 ms, 8 bits/byte, 520.83 bps
-  static const double sampleRate = 44100.0;
-  static const double bitDuration = 0.00192;
-  static const double markFreq = 2083.33;
-  static const double spaceFreq = 1562.5;
-  static const int preambleByte = 0xAB;
-  static const int preambleRepeat = 16;
-
-  // Header fields for test message
-  static String get _header =>
-      'ZCZC-EAS-RWT-012057-012081-012101-012103-012115+0030-2780415-WTSP/TV-';
-
-  static String get _eom => 'NNNN';
-
-  // Text message content
-  static String get _voiceMessage =>
-      'An EAS Participant has issued a Required Weekly Test for the following counties/areas: Hillsborough FL, Manatee FL, Pasco FL, Pinellas FL, and Sarasota FL at 12:15 am EDT on October 5 effective until 12:45 am EDT. Message from WTSP-TV.';
-
-  // ========== Public API ==========
-  static Future<Uint8List> generateSAMEWav() async {
-    // Compose the full message sequence:
-    // [header x3] [1 sec silence] [attention signal] [1 sec silence]
-    // [voice message (TTS)] [1 sec silence] [EOM x3]
-    List<_AudioChunk> chunks = [];
-
-    // Header x3
-    for (int i = 0; i < 3; ++i) {
-      chunks.add(_AudioChunk(await _generateSAMEBurst(_header), 1.0));
-      chunks.add(_AudioChunk(_silence(1.0), 1.0));
-    }
-
-    // Attention: 853 Hz + 960 Hz combined for 8 sec (broadcast style)
-    chunks.add(_AudioChunk(_dualTone([853.0, 960.0], 8.0), 8.0));
-    chunks.add(_AudioChunk(_silence(1.0), 1.0));
-
-    // Message (TTS is not available in Dart, so use 1050Hz for 5 sec as placeholder)
-    chunks.add(_AudioChunk(_singleTone(1050.0, 5.0), 5.0));
-    chunks.add(_AudioChunk(_silence(1.0), 1.0));
-
-    // EOM x3
-    for (int i = 0; i < 3; ++i) {
-      chunks.add(_AudioChunk(await _generateSAMEBurst(_eom), 1.0));
-      chunks.add(_AudioChunk(_silence(1.0), 1.0));
-    }
-
-    // Concatenate all PCM samples
-    List<int> pcm = [];
-    for (var chunk in chunks) {
-      pcm.addAll(chunk.samples);
-    }
-    // Compose WAV file
-    return _encodeWAV(Int16List.fromList(pcm), sampleRate.toInt());
-  }
-
-  // ========== Core ==========
-
-  // Generate SAME burst for a string (header or EOM)
-  static Future<List<int>> _generateSAMEBurst(String data) async {
-    // Format: 16x preamble bytes + ASCII bytes, each byte 8 bits LSB first, mark = 2083.33 Hz, space = 1562.5 Hz
-    List<int> bits = [];
-
-    // Preamble
-    for (int i = 0; i < preambleRepeat; ++i) {
-      bits.addAll(_byteToBits(preambleByte));
-    }
-    // Data
-    for (int i = 0; i < data.length; ++i) {
-      bits.addAll(_byteToBits(data.codeUnitAt(i) & 0x7F)); // ASCII, MSB zero
-    }
-
-    // Convert bits to PCM
-    List<int> pcm = [];
-    for (int b in bits) {
-      double freq = b == 1 ? markFreq : spaceFreq;
-      pcm.addAll(_sineWave(freq, bitDuration, sampleRate));
-    }
-    return pcm;
-  }
-
-  // Convert a byte to bits (LSB first)
-  static List<int> _byteToBits(int byte) {
-    List<int> bits = [];
-    for (int i = 0; i < 8; ++i) {
-      bits.add((byte >> i) & 1);
-    }
-    return bits;
-  }
-
-  // Generate silence (PCM)
-  static List<int> _silence(double durationSec) {
-    int samples = (sampleRate * durationSec).round();
-    return List<int>.filled(samples, 0);
-  }
-
-  // Dual-tone for EAS attention
-  static List<int> _dualTone(List<double> freqs, double durationSec) {
-    int samples = (sampleRate * durationSec).round();
-    List<int> pcm = [];
-    for (int i = 0; i < samples; ++i) {
-      double t = i / sampleRate;
-      double val = 0.0;
-      for (double f in freqs) {
-        val += sin(2 * pi * f * t);
-      }
-      val = (val / freqs.length) * 0.6; // scale
-      pcm.add((val * 32767).toInt());
-    }
-    return pcm;
-  }
-
-  // Single tone (1050 Hz for placeholder message)
-  static List<int> _singleTone(double freq, double durationSec) {
-    int samples = (sampleRate * durationSec).round();
-    List<int> pcm = [];
-    for (int i = 0; i < samples; ++i) {
-      double t = i / sampleRate;
-      double val = sin(2 * pi * freq * t) * 0.6;
-      pcm.add((val * 32767).toInt());
-    }
-    return pcm;
-  }
-
-  // Sine wave for bit
-  static List<int> _sineWave(double freq, double durationSec, double rate) {
-    int samples = (rate * durationSec).round();
-    List<int> pcm = [];
-    for (int i = 0; i < samples; ++i) {
-      double t = i / rate;
-      double val = sin(2 * pi * freq * t) * 0.35;
-      pcm.add((val * 32767).toInt());
-    }
-    return pcm;
-  }
-
-  // WAV encoding
-  static Uint8List _encodeWAV(Int16List pcm, int sampleRate) {
-    int byteRate = sampleRate * 2;
-    int blockAlign = 2;
-    int subchunk2Size = pcm.length * 2;
-    int chunkSize = 36 + subchunk2Size;
-    ByteData header = ByteData(44);
-
-    header.setUint8(0, 0x52); // "RIFF"
-    header.setUint8(1, 0x49);
-    header.setUint8(2, 0x46);
-    header.setUint8(3, 0x46);
-    header.setUint32(4, chunkSize, Endian.little);
-    header.setUint8(8, 0x57); // "WAVE"
-    header.setUint8(9, 0x41);
-    header.setUint8(10, 0x56);
-    header.setUint8(11, 0x45);
-    header.setUint8(12, 0x66); // "fmt "
-    header.setUint8(13, 0x6d);
-    header.setUint8(14, 0x74);
-    header.setUint8(15, 0x20);
-    header.setUint32(16, 16, Endian.little); // PCM chunk size
-    header.setUint16(20, 1, Endian.little); // Audio format (PCM)
-    header.setUint16(22, 1, Endian.little); // Num channels
-    header.setUint32(24, sampleRate, Endian.little);
-    header.setUint32(28, byteRate, Endian.little);
-    header.setUint16(32, blockAlign, Endian.little);
-    header.setUint16(34, 16, Endian.little); // Bits per sample
-    header.setUint8(36, 0x64); // "data"
-    header.setUint8(37, 0x61);
-    header.setUint8(38, 0x74);
-    header.setUint8(39, 0x61);
-    header.setUint32(40, subchunk2Size, Endian.little);
-
-    Uint8List wav = Uint8List(44 + subchunk2Size);
-    wav.setRange(0, 44, header.buffer.asUint8List());
-    wav.setRange(44, 44 + subchunk2Size, pcm.buffer.asUint8List());
-    return wav;
-  }
-}
-
-// Helper to track chunks
-class _AudioChunk {
-  final List<int> samples;
-  final double durationSec;
-  _AudioChunk(this.samples, this.durationSec);
 }
